@@ -1,0 +1,273 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import '../domain/conversation.dart';
+import '../domain/message.dart';
+import '../../../shared/services/notification_service.dart';
+
+class ChatRepository {
+  final SupabaseClient _client;
+  String? get currentUserId => _client.auth.currentUser?.id;
+
+  ChatRepository(this._client);
+
+  Future<Conversation> getOrCreateConversation({
+    required String adoptantId,
+    required String shelterId,
+    String? petId,
+    required String petName,
+  }) async {
+    // Buscar conversación existente SIN filtrar deleted — puede haber sido eliminada
+    final existingList = await _client
+        .from('conversations')
+        .select('*, shelters(name, avatar_url), pets(name, main_photo_url)')
+        .eq('adoptant_id', adoptantId)
+        .eq('shelter_id', shelterId)
+        .order('created_at', ascending: false)
+        .limit(1);
+
+    if ((existingList as List).isNotEmpty) {
+      final existing = Conversation.fromMap(existingList.first);
+
+      // Reactivar para ambos si fue eliminada por alguno
+      await _client
+          .from('conversations')
+          .update({'deleted_by_adoptant': false, 'deleted_by_shelter': false})
+          .eq('id', existing.id);
+
+      if (petId != null) {
+        if (existing.petId == null) {
+          await _client
+              .from('conversations')
+              .update({'pet_id': petId})
+              .eq('id', existing.id);
+        }
+
+        final existingMessage = await _client
+            .from('messages')
+            .select()
+            .eq('conversation_id', existing.id)
+            .eq('sender_id', adoptantId)
+            .ilike('content', '%$petName%')
+            .limit(1);
+
+        if ((existingMessage as List).isEmpty) {
+          await sendMessage(
+            conversationId: existing.id,
+            senderId: adoptantId,
+            content:
+                'Hola, estoy interesado en adoptar a $petName. ¿Me podrías dar más información?',
+          );
+        }
+
+        final updated = await _client
+            .from('conversations')
+            .select('*, shelters(name, avatar_url), pets(name, main_photo_url)')
+            .eq('id', existing.id)
+            .single();
+
+        return Conversation.fromMap(updated);
+      }
+
+      return existing;
+    }
+
+    // No existe — crear nueva
+    final insertData = {
+      'adoptant_id': adoptantId,
+      'shelter_id': shelterId,
+      if (petId != null) 'pet_id': petId,
+    };
+
+    final newConv = await _client
+        .from('conversations')
+        .insert(insertData)
+        .select('*, shelters(name, avatar_url), pets(name, main_photo_url)')
+        .single();
+
+    final conversation = Conversation.fromMap(newConv);
+
+    final message = petId != null
+        ? 'Hola, estoy interesado en adoptar a $petName. ¿Me podrías dar más información?'
+        : 'Hola, me gustaría obtener información sobre sus mascotas disponibles.';
+
+    await sendMessage(
+      conversationId: conversation.id,
+      senderId: adoptantId,
+      content: message,
+    );
+
+    return conversation;
+  }
+
+  Future<List<Conversation>> getAdoptantConversations(String adoptantId) async {
+    final response = await _client
+        .from('conversations')
+        .select('*, shelters(name, avatar_url), pets(name, main_photo_url)')
+        .eq('adoptant_id', adoptantId)
+        .eq('deleted_by_adoptant', false)
+        .order('last_message_at', ascending: false);
+
+    return (response as List).map((e) => Conversation.fromMap(e)).toList();
+  }
+
+  Future<List<Conversation>> getShelterConversations(String shelterId) async {
+    final response = await _client
+        .from('conversations')
+        .select('*, shelters(name, avatar_url), pets(name, main_photo_url)')
+        .eq('shelter_id', shelterId)
+        .eq('deleted_by_shelter', false)
+        .order('last_message_at', ascending: false);
+
+    final conversations = await Future.wait(
+      (response as List).map((conv) async {
+        final adoptantProfile = await _client
+            .from('profiles')
+            .select('full_name, avatar_url')
+            .eq('id', conv['adoptant_id'])
+            .maybeSingle();
+
+        final enriched = Map<String, dynamic>.from(conv);
+        enriched['profiles'] = adoptantProfile;
+        return enriched;
+      }),
+    );
+
+    return conversations.map((e) => Conversation.fromMap(e)).toList();
+  }
+
+  Future<List<Message>> getMessages(String conversationId) async {
+    final response = await _client
+        .from('messages')
+        .select()
+        .eq('conversation_id', conversationId)
+        .order('created_at', ascending: true);
+
+    return (response as List).map((e) => Message.fromMap(e)).toList();
+  }
+
+  Future<Message> sendMessage({
+    required String conversationId,
+    required String senderId,
+    required String content,
+  }) async {
+    final response = await _client
+        .from('messages')
+        .insert({
+          'conversation_id': conversationId,
+          'sender_id': senderId,
+          'content': content,
+        })
+        .select()
+        .single();
+
+    await _client
+        .from('conversations')
+        .update({
+          'last_message': content,
+          'last_message_at': DateTime.now().toIso8601String(),
+        })
+        .eq('id', conversationId);
+
+    // Reactivar conversación para ambos si fue eliminada
+    await _client
+        .from('conversations')
+        .update({'deleted_by_adoptant': false, 'deleted_by_shelter': false})
+        .eq('id', conversationId);
+
+    final conv = await _client
+        .from('conversations')
+        .select('adoptant_id, shelter_id, shelters(user_id)')
+        .eq('id', conversationId)
+        .single();
+
+    final currentUserId = _client.auth.currentUser?.id;
+    String recipientId;
+
+    if (conv['adoptant_id'] == currentUserId) {
+      recipientId = (conv['shelters'] as Map)['user_id'];
+    } else {
+      recipientId = conv['adoptant_id'];
+    }
+
+    await NotificationService.sendNotification(
+      userId: recipientId,
+      title: 'Nuevo mensaje',
+      body: content.length > 50 ? '${content.substring(0, 50)}...' : content,
+      data: {'type': 'nuevo_mensaje', 'reference_id': conversationId},
+    );
+
+    return Message.fromMap(response);
+  }
+
+  Stream<List<Message>> messagesStream(String conversationId) {
+    return _client
+        .from('messages')
+        .stream(primaryKey: ['id'])
+        .eq('conversation_id', conversationId)
+        .order('created_at', ascending: true)
+        .map((list) => list.map((e) => Message.fromMap(e)).toList());
+  }
+
+  Future<void> markAsRead({
+    required String conversationId,
+    required String userId,
+  }) async {
+    await _client
+        .from('messages')
+        .update({'is_read': true})
+        .eq('conversation_id', conversationId)
+        .neq('sender_id', userId);
+  }
+
+  Future<Conversation> getConversationById(String conversationId) async {
+    final response = await _client
+        .from('conversations')
+        .select('*, shelters(name, avatar_url), pets(name, main_photo_url)')
+        .eq('id', conversationId)
+        .single();
+
+    final adoptantProfile = await _client
+        .from('profiles')
+        .select('full_name, avatar_url')
+        .eq('id', response['adoptant_id'])
+        .maybeSingle();
+
+    final enriched = Map<String, dynamic>.from(response);
+    enriched['profiles'] = adoptantProfile;
+
+    return Conversation.fromMap(enriched);
+  }
+
+  Future<void> softDeleteConversation({
+    required String conversationId,
+    required bool isShelter,
+  }) async {
+    final field = isShelter ? 'deleted_by_shelter' : 'deleted_by_adoptant';
+    await _client
+        .from('conversations')
+        .update({field: true})
+        .eq('id', conversationId);
+  }
+
+  /// Cuando el adoptante envía un nuevo mensaje a una conversación que
+  /// había eliminado, se reactiva para él automáticamente.
+  Future<void> reactivateForAdoptant(String conversationId) async {
+    await _client
+        .from('conversations')
+        .update({'deleted_by_adoptant': false})
+        .eq('id', conversationId);
+  }
+
+  /// Cuando el refugio envía un nuevo mensaje a una conversación que
+  /// había eliminado, se reactiva para él automáticamente.
+  Future<void> reactivateForShelter(String conversationId) async {
+    await _client
+        .from('conversations')
+        .update({'deleted_by_shelter': false})
+        .eq('id', conversationId);
+  }
+}
+
+final chatRepositoryProvider = Provider<ChatRepository>((ref) {
+  return ChatRepository(Supabase.instance.client);
+});

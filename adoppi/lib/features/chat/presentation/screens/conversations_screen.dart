@@ -1,0 +1,415 @@
+// conversations_screen.dart
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../../core/theme/app_colors.dart';
+import '../controllers/chat_controller.dart';
+import '../../data/chat_repository.dart';
+import '../../domain/conversation.dart';
+import 'chat_screen.dart';
+import '../../../notifications/presentation/notification_bell.dart';
+
+class ConversationsScreen extends ConsumerStatefulWidget {
+  final bool isShelter;
+  final String? shelterId;
+
+  const ConversationsScreen({
+    super.key,
+    this.isShelter = false,
+    this.shelterId,
+  });
+
+  @override
+  ConsumerState<ConversationsScreen> createState() =>
+      _ConversationsScreenState();
+}
+
+class _ConversationsScreenState extends ConsumerState<ConversationsScreen> {
+  String _timeLabel(DateTime? dt) {
+    if (dt == null) return '';
+    final local = dt.isUtc ? dt.toLocal() : dt;
+    if (true) {
+      final now = DateTime.now();
+      debugPrint('🕐 Hora local del dispositivo: $now');
+      debugPrint('🕐 Zona horaria offset: ${now.timeZoneOffset}');
+
+      final diff = now.difference(local);
+      if (diff.inMinutes < 1) return 'Ahora';
+      if (diff.inMinutes < 60) return 'Hace ${diff.inMinutes} min';
+      if (diff.inHours < 24) return 'Hace ${diff.inHours}h';
+      return '${local.day}/${local.month}/${local.year}';
+    }
+  }
+
+  Future<void> _deleteConversation(Conversation conv) async {
+    try {
+      await ref
+          .read(chatRepositoryProvider)
+          .softDeleteConversation(
+            conversationId: conv.id,
+            isShelter: widget.isShelter,
+          );
+
+      if (widget.isShelter && widget.shelterId != null) {
+        ref.invalidate(shelterConversationsProvider(widget.shelterId!));
+      } else {
+        ref.invalidate(adoptantConversationsProvider);
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Conversación eliminada'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Error al eliminar la conversación'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<bool> _confirmDelete() async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Eliminar conversación'),
+        content: const Text(
+          '¿Estás seguro que quieres eliminar esta conversación? '
+          'Solo se eliminará de tu lista.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
+            child: const Text('Eliminar'),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conversationsAsync = widget.isShelter && widget.shelterId != null
+        ? ref.watch(shelterConversationsProvider(widget.shelterId!))
+        : ref.watch(adoptantConversationsProvider);
+
+    return Scaffold(
+      backgroundColor: AppColors.background,
+      body: Column(
+        children: [
+          // Header con fondo morado
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 52, 20, 24),
+            decoration: const BoxDecoration(
+              color: AppColors.primary,
+              borderRadius: BorderRadius.vertical(bottom: Radius.circular(24)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Adoppi',
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                      Text(
+                        'Mensajes',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: Colors.white.withOpacity(0.85),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                NotificationBell(iconColor: Colors.white),
+              ],
+            ),
+          ),
+
+          // Lista de conversaciones
+          Expanded(
+            child: conversationsAsync.when(
+              loading: () => const Center(
+                child: CircularProgressIndicator(color: AppColors.primary),
+              ),
+              error: (e, _) =>
+                  const Center(child: Text('Error al cargar conversaciones')),
+              data: (conversations) {
+                if (conversations.isEmpty) {
+                  return RefreshIndicator(
+                    color: AppColors.primary,
+                    onRefresh: () async {
+                      if (widget.isShelter && widget.shelterId != null) {
+                        ref.invalidate(
+                          shelterConversationsProvider(widget.shelterId!),
+                        );
+                      } else {
+                        ref.invalidate(adoptantConversationsProvider);
+                      }
+                    },
+                    child: ListView(
+                      children: const [
+                        SizedBox(height: 100),
+                        Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.chat_bubble_outline,
+                                size: 64,
+                                color: AppColors.textHint,
+                              ),
+                              SizedBox(height: 16),
+                              Text(
+                                'No tienes conversaciones aún',
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  color: AppColors.textSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+
+                return RefreshIndicator(
+                  color: AppColors.primary,
+                  onRefresh: () async {
+                    if (widget.isShelter && widget.shelterId != null) {
+                      ref.invalidate(
+                        shelterConversationsProvider(widget.shelterId!),
+                      );
+                    } else {
+                      ref.invalidate(adoptantConversationsProvider);
+                    }
+                  },
+                  child: _DismissibleList(
+                    conversations: conversations,
+                    isShelter: widget.isShelter,
+                    shelterId: widget.shelterId,
+                    timeLabel: _timeLabel,
+                    onDelete: _deleteConversation,
+                    onConfirmDelete: _confirmDelete,
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DismissibleList extends StatefulWidget {
+  final List<Conversation> conversations;
+  final bool isShelter;
+  final String? shelterId;
+  final String Function(DateTime?) timeLabel;
+  final Future<void> Function(Conversation) onDelete;
+  final Future<bool> Function() onConfirmDelete;
+
+  const _DismissibleList({
+    required this.conversations,
+    required this.isShelter,
+    required this.shelterId,
+    required this.timeLabel,
+    required this.onDelete,
+    required this.onConfirmDelete,
+  });
+
+  @override
+  State<_DismissibleList> createState() => _DismissibleListState();
+}
+
+class _DismissibleListState extends State<_DismissibleList> {
+  late List<Conversation> _localConversations;
+
+  @override
+  void initState() {
+    super.initState();
+    _localConversations = List.from(widget.conversations);
+  }
+
+  @override
+  void didUpdateWidget(_DismissibleList oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.conversations != widget.conversations) {
+      _localConversations = List.from(widget.conversations);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView.builder(
+      itemCount: _localConversations.length,
+      itemBuilder: (context, index) {
+        final conv = _localConversations[index];
+        return Dismissible(
+          key: Key(conv.id),
+          direction: DismissDirection.endToStart,
+          background: Container(
+            alignment: Alignment.centerRight,
+            padding: const EdgeInsets.only(right: 20),
+            color: AppColors.error,
+            child: const Icon(
+              Icons.delete_outline,
+              color: Colors.white,
+              size: 28,
+            ),
+          ),
+          confirmDismiss: (direction) => widget.onConfirmDelete(),
+          onDismissed: (direction) {
+            setState(() {
+              _localConversations.removeAt(index);
+            });
+            widget.onDelete(conv);
+          },
+          child: _ConversationTile(
+            conversation: conv,
+            isShelter: widget.isShelter,
+            shelterId: widget.shelterId,
+            timeLabel: widget.timeLabel(conv.lastMessageAt),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _ConversationTile extends ConsumerWidget {
+  final Conversation conversation;
+  final bool isShelter;
+  final String? shelterId;
+  final String timeLabel;
+
+  const _ConversationTile({
+    required this.conversation,
+    required this.isShelter,
+    this.shelterId,
+    required this.timeLabel,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final shelterAvatar = conversation.shelterInfo?['avatar_url'] as String?;
+    final adoptantAvatar = conversation.adoptantInfo?['avatar_url'] as String?;
+    final avatarUrl = isShelter ? adoptantAvatar : shelterAvatar;
+
+    final shelterName =
+        conversation.shelterInfo?['name'] as String? ?? 'Refugio';
+    final adoptantName =
+        conversation.adoptantInfo?['full_name'] as String? ?? 'Adoptante';
+    final name = isShelter ? adoptantName : shelterName;
+
+    final petName = conversation.petInfo?['name'] as String?;
+
+    return Column(
+      children: [
+        ListTile(
+          onTap: () async {
+            final fullConversation = await ref
+                .read(chatRepositoryProvider)
+                .getConversationById(conversation.id);
+
+            if (context.mounted) {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => ChatScreen(
+                    conversation: fullConversation,
+                    isShelter: isShelter,
+                  ),
+                ),
+              ).then((_) {
+                if (isShelter && shelterId != null) {
+                  ref.invalidate(shelterConversationsProvider(shelterId!));
+                } else {
+                  ref.invalidate(adoptantConversationsProvider);
+                }
+              });
+            }
+          },
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 20,
+            vertical: 8,
+          ),
+          leading: CircleAvatar(
+            radius: 28,
+            backgroundColor: AppColors.divider,
+            backgroundImage: avatarUrl != null ? NetworkImage(avatarUrl) : null,
+            child: avatarUrl == null
+                ? const Icon(Icons.person, color: AppColors.textHint)
+                : null,
+          ),
+          title: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  name,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 15,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
+              ),
+              Text(
+                timeLabel,
+                style: const TextStyle(fontSize: 11, color: AppColors.textHint),
+              ),
+            ],
+          ),
+          subtitle: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (petName != null)
+                Text(
+                  'Sobre: $petName',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: AppColors.primary,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              if (conversation.lastMessage != null)
+                Text(
+                  conversation.lastMessage!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    color: AppColors.textSecondary,
+                  ),
+                ),
+            ],
+          ),
+        ),
+        const Divider(height: 1, indent: 76),
+      ],
+    );
+  }
+}
